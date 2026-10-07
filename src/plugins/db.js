@@ -10,6 +10,7 @@ async function dbPlugin(fastify, opts) {
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
     ssl: { rejectUnauthorized: false },
+    family: 4,
   })
 
   pool.on("error", (err) => {
