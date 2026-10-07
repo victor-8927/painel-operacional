@@ -2,6 +2,7 @@
 import Fastify from "fastify"
 import fastifyWebsocket from "@fastify/websocket"
 import fastifyCors from "@fastify/cors"
+import fastifyMultipart from "@fastify/multipart"
 
 import dbPlugin    from "./plugins/db.js"
 import redisPlugin from "./plugins/redis.js"
@@ -25,6 +26,7 @@ const fastify = Fastify({
 
 await fastify.register(fastifyCors, { origin: process.env.CORS_ORIGIN || "*" })
 await fastify.register(fastifyWebsocket)
+await fastify.register(fastifyMultipart, { limits: { fileSize: 10 * 1024 * 1024 } }) // 10 MB
 await fastify.register(dbPlugin)
 await fastify.register(redisPlugin)
 
