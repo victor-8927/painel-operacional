@@ -42,10 +42,30 @@ export default async function plansRoutes(fastify) {
       return digits ? String(parseInt(digits, 10)) : null
     }
 
-    // Agrupa por VDA: cada VDA pode ter múltiplas linhas (PRE-VENDA, TROCAS, BONIFICAÇÃO…)
-    // Somamos os SKUs de todas as linhas e usamos motorista/rota/cap da primeira linha do VDA
-    const vdaMap = new Map()   // key → { sequence, vda, rota, motorista_name, capacity_kg, kg3..kg50, obs }
-    const vdaOrder = []        // ordem de inserção para manter a sequência original
+    // Normaliza o tipo de volume da coluna J (col[9])
+    // Possíveis valores: PRE-VENDA, TROCAS, MANIFESTO, CONSIGNADA, BONIFICAÇÃO, SALDO
+    const VOLUME_TYPES = ["PRE-VENDA", "TROCAS", "MANIFESTO", "CONSIGNADA", "BONIFICAÇÃO", "SALDO"]
+    const toVolumeType = (v) => {
+      if (!v) return null
+      const s = String(v).trim().toUpperCase()
+        .normalize("NFD").replace(/[̀-ͯ]/g, "")  // remove acentos para comparar
+      if (s.includes("PRE") && s.includes("VENDA")) return "PRE-VENDA"
+      if (s.includes("TROCA"))    return "TROCAS"
+      if (s.includes("MANIFES"))  return "MANIFESTO"
+      if (s.includes("CONSIG"))   return "CONSIGNADA"
+      if (s.includes("BONIF"))    return "BONIFICAÇÃO"
+      if (s.includes("SALDO"))    return "SALDO"
+      return s   // mantém como está se não reconheceu
+    }
+
+    // Agrupa linhas por VDA.
+    // Cada VDA tem:
+    //   - metadados fixos: rota, motorista, capacidade (da 1ª linha do VDA)
+    //   - volumes[]: array com uma entrada por linha de tipo de volume
+    //                { type, oc_number, oc_pending, kg3..kg50, peso_kg, obs }
+    //   - totais: soma de todos os SKUs de todos os volumes (para percentual de carga)
+    const vdaMap = new Map()
+    const vdaOrder = []
 
     for (let i = headerRow + 1; i < raw.length; i++) {
       const r = raw[i]
@@ -53,49 +73,93 @@ export default async function plansRoutes(fastify) {
       const vdaKey = toKey(r[1])
       if (!vdaKey) continue
 
+      // col[9] = coluna J = tipo de volume (PRE-VENDA / TROCAS / MANIFESTO …)
+      const volumeType = toVolumeType(r[9])
+
+      // col[7] = coluna H = Nº Romaneio / OC
+      // SALDO nunca tem OC; MANIFESTO e CONSIGNADA têm OC exclusiva
+      const rawOc = r[7] ? String(r[7]).trim() : null
+      const ocNumber = rawOc && rawOc !== "" && rawOc !== "0" ? rawOc : null
+
+      // oc_pending = tem volume mas ainda sem número de OC (pedido chegou fora de horário)
+      // SALDO não tem OC por definição — não é pending
+      const ocPending = ocNumber === null && volumeType !== "SALDO" && volumeType !== null
+
       const kg3  = numOf(r[10]), kg5  = numOf(r[11]), kg10 = numOf(r[12])
       const kg20 = numOf(r[13]), kg40 = numOf(r[14]), kg50 = numOf(r[15])
+      const pesoKg = kg3*3 + kg5*5 + kg10*10 + kg20*20 + kg40*40 + kg50*50
+      const obs  = r[17] ? String(r[17]).trim() : null
+
+      // Descarta linhas completamente vazias (sem tipo de volume e sem SKUs)
+      if (!volumeType && pesoKg === 0) continue
 
       if (vdaMap.has(vdaKey)) {
-        // VDA já existe → acumula SKUs (PRE-VENDA + TROCAS + outras linhas)
         const entry = vdaMap.get(vdaKey)
+        // Acumula totais para cálculo de percentual
         entry.planned_kg3  += kg3
         entry.planned_kg5  += kg5
         entry.planned_kg10 += kg10
         entry.planned_kg20 += kg20
         entry.planned_kg40 += kg40
         entry.planned_kg50 += kg50
-        // Obs: pega a observação da linha que tiver, sem sobrescrever
-        if (!entry.obs && r[17]) entry.obs = String(r[17]).trim()
+        // Adiciona linha de volume (cada tipo é uma entrada separada)
+        if (volumeType || pesoKg > 0) {
+          entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
+            kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
+        }
       } else {
-        // Primeira linha deste VDA → cria entrada, guarda rota/motorista/cap
+        // Primeira linha deste VDA
         const entry = {
           vda:            vdaKey,
           rota:           r[0] ? String(r[0]).trim() : null,
           motorista_name: r[2] ? String(r[2]).trim() : null,
           capacity_kg:    numOf(r[3]),
-          planned_kg3:    kg3,
-          planned_kg5:    kg5,
-          planned_kg10:   kg10,
-          planned_kg20:   kg20,
-          planned_kg40:   kg40,
-          planned_kg50:   kg50,
-          obs:            r[17] ? String(r[17]).trim() : null,
+          // Totais somados de todos os volumes (para percentual de carregamento)
+          planned_kg3:  kg3,
+          planned_kg5:  kg5,
+          planned_kg10: kg10,
+          planned_kg20: kg20,
+          planned_kg40: kg40,
+          planned_kg50: kg50,
+          // Detalhamento por tipo de volume (PRE-VENDA, TROCAS, MANIFESTO…)
+          volumes: [],
+        }
+        if (volumeType || pesoKg > 0) {
+          entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
+            kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
         }
         vdaMap.set(vdaKey, entry)
         vdaOrder.push(vdaKey)
       }
     }
 
-    // Filtra VDAs sem nenhuma quantidade e sem capacidade (linhas em branco/cabeçalho)
+    // Monta array final, filtrando VDAs sem nenhum dado real
     const vehicles = []
     let seq = 0
     for (const key of vdaOrder) {
       const v = vdaMap.get(key)
       const totalSacos = v.planned_kg3 + v.planned_kg5 + v.planned_kg10 + v.planned_kg20 + v.planned_kg40 + v.planned_kg50
-      if (totalSacos === 0 && v.capacity_kg === 0) continue
+      if (totalSacos === 0 && v.capacity_kg === 0 && v.volumes.length === 0) continue
       seq++
-      vehicles.push({ sequence: seq, ...v })
+      // Campo de conveniência: primeiro OC encontrado (compatibilidade com tabela do painel-central)
+      const firstOc = v.volumes.find(vol => vol.oc_number)
+      const hasPending = v.volumes.some(vol => vol.oc_pending)
+      vehicles.push({
+        sequence: seq,
+        vda: v.vda,
+        rota: v.rota,
+        motorista_name: v.motorista_name,
+        capacity_kg: v.capacity_kg,
+        planned_kg3:  v.planned_kg3,
+        planned_kg5:  v.planned_kg5,
+        planned_kg10: v.planned_kg10,
+        planned_kg20: v.planned_kg20,
+        planned_kg40: v.planned_kg40,
+        planned_kg50: v.planned_kg50,
+        oc_number:  firstOc ? firstOc.oc_number : null,
+        oc_pending: hasPending,
+        volumes: v.volumes,   // detalhamento completo por tipo
+      })
     }
 
     if (vehicles.length === 0) throw Object.assign(new Error("Nenhum veiculo encontrado"), { code: 422 })
