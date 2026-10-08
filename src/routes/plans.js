@@ -42,27 +42,60 @@ export default async function plansRoutes(fastify) {
       return digits ? String(parseInt(digits, 10)) : null
     }
 
-    const vehicles = []
-    let seq = 0
+    // Agrupa por VDA: cada VDA pode ter múltiplas linhas (PRE-VENDA, TROCAS, BONIFICAÇÃO…)
+    // Somamos os SKUs de todas as linhas e usamos motorista/rota/cap da primeira linha do VDA
+    const vdaMap = new Map()   // key → { sequence, vda, rota, motorista_name, capacity_kg, kg3..kg50, obs }
+    const vdaOrder = []        // ordem de inserção para manter a sequência original
+
     for (let i = headerRow + 1; i < raw.length; i++) {
       const r = raw[i]
       if (!r || r.every(c => c === null)) continue
       const vdaKey = toKey(r[1])
       if (!vdaKey) continue
-      const kg3 = numOf(r[10]), kg5 = numOf(r[11]), kg10 = numOf(r[12])
+
+      const kg3  = numOf(r[10]), kg5  = numOf(r[11]), kg10 = numOf(r[12])
       const kg20 = numOf(r[13]), kg40 = numOf(r[14]), kg50 = numOf(r[15])
-      if (kg3 + kg5 + kg10 + kg20 + kg40 + kg50 === 0 && numOf(r[3]) === 0) continue
+
+      if (vdaMap.has(vdaKey)) {
+        // VDA já existe → acumula SKUs (PRE-VENDA + TROCAS + outras linhas)
+        const entry = vdaMap.get(vdaKey)
+        entry.planned_kg3  += kg3
+        entry.planned_kg5  += kg5
+        entry.planned_kg10 += kg10
+        entry.planned_kg20 += kg20
+        entry.planned_kg40 += kg40
+        entry.planned_kg50 += kg50
+        // Obs: pega a observação da linha que tiver, sem sobrescrever
+        if (!entry.obs && r[17]) entry.obs = String(r[17]).trim()
+      } else {
+        // Primeira linha deste VDA → cria entrada, guarda rota/motorista/cap
+        const entry = {
+          vda:            vdaKey,
+          rota:           r[0] ? String(r[0]).trim() : null,
+          motorista_name: r[2] ? String(r[2]).trim() : null,
+          capacity_kg:    numOf(r[3]),
+          planned_kg3:    kg3,
+          planned_kg5:    kg5,
+          planned_kg10:   kg10,
+          planned_kg20:   kg20,
+          planned_kg40:   kg40,
+          planned_kg50:   kg50,
+          obs:            r[17] ? String(r[17]).trim() : null,
+        }
+        vdaMap.set(vdaKey, entry)
+        vdaOrder.push(vdaKey)
+      }
+    }
+
+    // Filtra VDAs sem nenhuma quantidade e sem capacidade (linhas em branco/cabeçalho)
+    const vehicles = []
+    let seq = 0
+    for (const key of vdaOrder) {
+      const v = vdaMap.get(key)
+      const totalSacos = v.planned_kg3 + v.planned_kg5 + v.planned_kg10 + v.planned_kg20 + v.planned_kg40 + v.planned_kg50
+      if (totalSacos === 0 && v.capacity_kg === 0) continue
       seq++
-      vehicles.push({
-        sequence: seq,
-        vda: vdaKey,
-        rota: r[0] ? String(r[0]).trim() : null,
-        motorista_name: r[2] ? String(r[2]).trim() : null,
-        capacity_kg: numOf(r[3]),
-        planned_kg3: kg3, planned_kg5: kg5, planned_kg10: kg10,
-        planned_kg20: kg20, planned_kg40: kg40, planned_kg50: kg50,
-        obs: r[17] ? String(r[17]).trim() : null,
-      })
+      vehicles.push({ sequence: seq, ...v })
     }
 
     if (vehicles.length === 0) throw Object.assign(new Error("Nenhum veiculo encontrado"), { code: 422 })
