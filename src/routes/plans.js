@@ -63,14 +63,16 @@ export default async function plansRoutes(fastify) {
       return result
     }
 
-    // Agrupa linhas por VDA.
-    // Cada VDA tem:
-    //   - metadados fixos: rota, motorista, capacidade (da 1ª linha do VDA)
-    //   - volumes[]: array com uma entrada por linha de tipo de volume
-    //                { type, oc_number, oc_pending, kg3..kg50, peso_kg, obs }
-    //   - totais: soma de todos os SKUs de todos os volumes (para percentual de carga)
-    // Map preserva ordem de inserção (ES2015+) — vdaOrder separado é desnecessário
-    const vdaMap = new Map()
+    // Agrupa linhas por viagem (VDA + ocorrência).
+    // O mesmo VDA pode aparecer duas vezes na planilha quando há recarga (segunda viagem).
+    // Detectamos isso rastreando qual VDA estava ativo: quando o VDA muda de volta para um
+    // já visto após ter passado por outro VDA, é uma nova entrada — não acumulamos.
+    //
+    // Chave interna: "${vdaKey}#${N}" onde N começa em 0 (a exportada é só vda + recarga flag).
+    // Map preserva ordem de inserção (ES2015+).
+    const vdaMap   = new Map()   // chave composta → entry
+    const vdaCount = new Map()   // vdaKey → quantas entradas já criadas
+    let activeKey  = null        // chave composta da entrada corrente
 
     for (let i = headerRow + 1; i < raw.length; i++) {
       const r = raw[i]
@@ -78,38 +80,31 @@ export default async function plansRoutes(fastify) {
       const vdaKey = toKey(r[1])
       if (!vdaKey) continue
 
-      // Verifica tipo de volume antes de calcular peso (early exit)
       const volumeType = toVolumeType(r[9])
 
       const kg3  = numOf(r[10]), kg5  = numOf(r[11]), kg10 = numOf(r[12])
       const kg20 = numOf(r[13]), kg40 = numOf(r[14]), kg50 = numOf(r[15])
       const pesoKg = kg3*3 + kg5*5 + kg10*10 + kg20*20 + kg40*40 + kg50*50
 
-      // Descarta linhas completamente vazias (sem tipo de volume e sem SKUs)
       if (!volumeType && pesoKg === 0) continue
 
-      // col[7] = coluna H = Nº Romaneio / OC
       const rawOc = r[7] ? String(r[7]).trim() : null
       const ocNumber = rawOc && rawOc !== "" && rawOc !== "0" ? rawOc : null
-      // SALDO não tem OC por definição — não é pending
       const ocPending = ocNumber === null && volumeType !== "SALDO" && volumeType !== null
       const obs = r[17] ? String(r[17]).trim() : null
 
-      if (vdaMap.has(vdaKey)) {
-        const entry = vdaMap.get(vdaKey)
-        entry.planned_kg3  += kg3
-        entry.planned_kg5  += kg5
-        entry.planned_kg10 += kg10
-        entry.planned_kg20 += kg20
-        entry.planned_kg40 += kg40
-        entry.planned_kg50 += kg50
-        if (volumeType || pesoKg > 0) {
-          entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
-            kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
-        }
-      } else {
+      // Determina se esta linha pertence à entrada ativa ou inicia uma nova
+      const activeVda = activeKey ? activeKey.split("#")[0] : null
+      if (activeVda !== vdaKey) {
+        // VDA mudou — verifica se é um VDA novo ou uma nova ocorrência de um já visto
+        const n = vdaCount.get(vdaKey) ?? 0
+        const compositeKey = `${vdaKey}#${n}`
+        vdaCount.set(vdaKey, n + 1)
+        activeKey = compositeKey
+
         const entry = {
           vda:            vdaKey,
+          recarga:        n > 0,                           // true a partir da 2ª viagem
           rota:           r[0] ? String(r[0]).trim() : null,
           motorista_name: r[2] ? String(r[2]).trim() : null,
           capacity_kg:    numOf(r[3]),
@@ -121,7 +116,16 @@ export default async function plansRoutes(fastify) {
           entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
             kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
         }
-        vdaMap.set(vdaKey, entry)
+        vdaMap.set(compositeKey, entry)
+      } else {
+        // Mesma entrada ativa — acumula (ex: linha PRE-VENDA + linha TROCAS do mesmo bloco)
+        const entry = vdaMap.get(activeKey)
+        entry.planned_kg3  += kg3;  entry.planned_kg5  += kg5;  entry.planned_kg10 += kg10
+        entry.planned_kg20 += kg20; entry.planned_kg40 += kg40; entry.planned_kg50 += kg50
+        if (volumeType || pesoKg > 0) {
+          entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
+            kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
+        }
       }
     }
 
@@ -220,10 +224,11 @@ export default async function plansRoutes(fastify) {
          SELECT $1, unnest($2::int[]), unnest($3::text[]), unnest($4::text[]),
                 unnest($5::vehicle_type_enum[]), unnest($6::int[]), unnest($7::text[]),
                 unnest($8::text[][]), 'aguardando_carga'
-         RETURNING id, vda`,
+         RETURNING id, vda, sequence`,
         [planId, vSeqs, vRotas, vVdas, vTypes, vCaps, vMots, vEquipes]
       )
-      const vehicleIdByVda = new Map(insertedVehicles.map(r => [r.vda, r.id]))
+      // Correlaciona por sequence — único por plano, mesmo VDA podendo aparecer 2×
+      const vehicleIdBySeq = new Map(insertedVehicles.map(r => [r.sequence, r.id]))
       const vehicleIds = insertedVehicles.map(r => ({ vda: r.vda, id: r.id }))
 
       // Bulk insert de volumes — 1 query para todos os volumes de todos os veículos
@@ -233,7 +238,7 @@ export default async function plansRoutes(fastify) {
       const volPeso = [], volObs = []
 
       for (const v of plan.vehicles) {
-        const vehicleId = vehicleIdByVda.get(v.vda)
+        const vehicleId = vehicleIdBySeq.get(v.sequence)
         if (!vehicleId) continue
         const isNewFormat = "planned_kg5" in v || "planned_kg10" in v
 
@@ -315,15 +320,16 @@ export default async function plansRoutes(fastify) {
       const sheetName     = parsed.sheetName
 
       // Extrai apenas os campos relevantes para programação (kg5/10/20/40)
+      // v.sequence é único por entry (mesmo VDA pode aparecer 2× com sequences distintos)
       const vehicles = parsed.vehicles
-        .map((v, idx) => {
+        .map((v) => {
           const kg5  = v.planned_kg5  || 0
           const kg10 = v.planned_kg10 || 0
           const kg20 = v.planned_kg20 || 0
           const kg40 = v.planned_kg40 || 0
           const obs  = v.volumes?.[0]?.obs || null
           if (kg5 === 0 && kg10 === 0 && kg20 === 0 && kg40 === 0 && v.capacity_kg === 0) return null
-          return { seq: idx + 1, vda: v.vda, rota: v.rota, capacity_kg: v.capacity_kg, kg5, kg10, kg20, kg40, obs }
+          return { seq: v.sequence, vda: v.vda, rota: v.rota, capacity_kg: v.capacity_kg, kg5, kg10, kg20, kg40, obs }
         })
         .filter(Boolean)
 
@@ -343,22 +349,23 @@ export default async function plansRoutes(fastify) {
       const planId = plan.id
 
       // ── E) Bulk lookup + update/insert — O(3) queries independente de N ──────
-      const vdaList = vehicles.map(v => v.vda)
+      // Usa sequence como chave — único por plano, mesmo VDA podendo aparecer 2× (carga + recarga)
+      const seqList  = vehicles.map(v => v.seq)
       const { rows: existingVehicles } = await fastify.db.query(
-        `SELECT id, vda FROM vehicles WHERE daily_plan_id = $1 AND vda = ANY($2::text[])`,
-        [planId, vdaList]
+        `SELECT id, vda, sequence FROM vehicles WHERE daily_plan_id = $1 AND sequence = ANY($2::int[])`,
+        [planId, seqList]
       )
-      const vehicleIdByVda = new Map(existingVehicles.map(r => [r.vda, r.id]))
-      const foundVdas = new Set(existingVehicles.map(r => r.vda))
+      const vehicleIdBySeq = new Map(existingVehicles.map(r => [r.sequence, r.id]))
+      const foundSeqs = new Set(existingVehicles.map(r => r.sequence))
 
       // Separa veículos encontrados dos não encontrados
-      const notFound = vehicles.filter(v => !foundVdas.has(v.vda))
-      const toProcess = vehicles.filter(v => foundVdas.has(v.vda))
+      const notFound  = vehicles.filter(v => !foundSeqs.has(v.seq))
+      const toProcess = vehicles.filter(v =>  foundSeqs.has(v.seq))
 
-      const results = notFound.map(v => ({ vda: v.vda, status: "nao_encontrado_no_plano" }))
+      const results = notFound.map(v => ({ vda: v.vda, seq: v.seq, status: "nao_encontrado_no_plano" }))
 
       if (toProcess.length > 0) {
-        const vehicleIds = toProcess.map(v => vehicleIdByVda.get(v.vda))
+        const vehicleIds = toProcess.map(v => vehicleIdBySeq.get(v.seq))
 
         // Busca o primeiro volume de cada veículo em bulk
         const { rows: existingVols } = await fastify.db.query(
@@ -369,8 +376,8 @@ export default async function plansRoutes(fastify) {
         )
         const volIdByVehicleId = new Map(existingVols.map(r => [r.vehicle_id, r.id]))
 
-        const toUpdate = toProcess.filter(v => volIdByVehicleId.has(vehicleIdByVda.get(v.vda)))
-        const toCreate = toProcess.filter(v => !volIdByVehicleId.has(vehicleIdByVda.get(v.vda)))
+        const toUpdate = toProcess.filter(v => volIdByVehicleId.has(vehicleIdBySeq.get(v.seq)))
+        const toCreate = toProcess.filter(v => !volIdByVehicleId.has(vehicleIdBySeq.get(v.seq)))
 
         const client = await fastify.db.pool.connect()
         try {
@@ -378,7 +385,7 @@ export default async function plansRoutes(fastify) {
 
           // UPDATE em bulk com UNNEST
           if (toUpdate.length > 0) {
-            const upIds  = toUpdate.map(v => volIdByVehicleId.get(vehicleIdByVda.get(v.vda)))
+            const upIds  = toUpdate.map(v => volIdByVehicleId.get(vehicleIdBySeq.get(v.seq)))
             const upKg5  = toUpdate.map(v => v.kg5)
             const upKg10 = toUpdate.map(v => v.kg10)
             const upKg20 = toUpdate.map(v => v.kg20)
@@ -398,12 +405,12 @@ export default async function plansRoutes(fastify) {
               [upIds, upKg5, upKg10, upKg20, upKg40, upObs]
             )
             for (const v of toUpdate)
-              results.push({ vda: v.vda, status: "atualizado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
+              results.push({ vda: v.vda, seq: v.seq, status: "atualizado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
           }
 
           // INSERT em bulk com UNNEST
           if (toCreate.length > 0) {
-            const cIds  = toCreate.map(v => vehicleIdByVda.get(v.vda))
+            const cIds  = toCreate.map(v => vehicleIdBySeq.get(v.seq))
             const cKg5  = toCreate.map(v => v.kg5)
             const cKg10 = toCreate.map(v => v.kg10)
             const cKg20 = toCreate.map(v => v.kg20)
@@ -417,7 +424,7 @@ export default async function plansRoutes(fastify) {
               [cIds, cKg5, cKg10, cKg20, cKg40, cObs]
             )
             for (const v of toCreate)
-              results.push({ vda: v.vda, status: "criado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
+              results.push({ vda: v.vda, seq: v.seq, status: "criado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
           }
 
           await client.query("COMMIT")
