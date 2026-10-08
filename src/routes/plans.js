@@ -9,7 +9,7 @@ export default async function plansRoutes(fastify) {
     // Determinar data de operação
     let operationDate = targetDate
     if (!operationDate) {
-      const now = new Date(Date.now() - 3 * 60 * 60 * 1000)
+      const now = new Date(Date.now() - 4 * 60 * 60 * 1000)  // Manaus UTC-4
       operationDate = now.toISOString().split("T")[0]
     }
 
@@ -44,18 +44,23 @@ export default async function plansRoutes(fastify) {
 
     // Normaliza o tipo de volume da coluna J (col[9])
     // Possíveis valores: PRE-VENDA, TROCAS, MANIFESTO, CONSIGNADA, BONIFICAÇÃO, SALDO
-    const VOLUME_TYPES = ["PRE-VENDA", "TROCAS", "MANIFESTO", "CONSIGNADA", "BONIFICAÇÃO", "SALDO"]
+    // toVolumeType com cache — normalize roda no máximo 1x por valor único
+    const _vtCache = new Map()
     const toVolumeType = (v) => {
       if (!v) return null
+      if (_vtCache.has(v)) return _vtCache.get(v)
       const s = String(v).trim().toUpperCase()
-        .normalize("NFD").replace(/[̀-ͯ]/g, "")  // remove acentos para comparar
-      if (s.includes("PRE") && s.includes("VENDA")) return "PRE-VENDA"
-      if (s.includes("TROCA"))    return "TROCAS"
-      if (s.includes("MANIFES"))  return "MANIFESTO"
-      if (s.includes("CONSIG"))   return "CONSIGNADA"
-      if (s.includes("BONIF"))    return "BONIFICAÇÃO"
-      if (s.includes("SALDO"))    return "SALDO"
-      return s   // mantém como está se não reconheceu
+        .normalize("NFD").replace(/[̀-ͯ]/g, "")
+      let result
+      if (s.includes("PRE") && s.includes("VENDA")) result = "PRE-VENDA"
+      else if (s.includes("TROCA"))   result = "TROCAS"
+      else if (s.includes("MANIFES")) result = "MANIFESTO"
+      else if (s.includes("CONSIG"))  result = "CONSIGNADA"
+      else if (s.includes("BONIF"))   result = "BONIFICAÇÃO"
+      else if (s.includes("SALDO"))   result = "SALDO"
+      else result = s
+      _vtCache.set(v, result)
+      return result
     }
 
     // Agrupa linhas por VDA.
@@ -64,8 +69,8 @@ export default async function plansRoutes(fastify) {
     //   - volumes[]: array com uma entrada por linha de tipo de volume
     //                { type, oc_number, oc_pending, kg3..kg50, peso_kg, obs }
     //   - totais: soma de todos os SKUs de todos os volumes (para percentual de carga)
+    // Map preserva ordem de inserção (ES2015+) — vdaOrder separado é desnecessário
     const vdaMap = new Map()
-    const vdaOrder = []
 
     for (let i = headerRow + 1; i < raw.length; i++) {
       const r = raw[i]
@@ -73,55 +78,43 @@ export default async function plansRoutes(fastify) {
       const vdaKey = toKey(r[1])
       if (!vdaKey) continue
 
-      // col[9] = coluna J = tipo de volume (PRE-VENDA / TROCAS / MANIFESTO …)
+      // Verifica tipo de volume antes de calcular peso (early exit)
       const volumeType = toVolumeType(r[9])
-
-      // col[7] = coluna H = Nº Romaneio / OC
-      // SALDO nunca tem OC; MANIFESTO e CONSIGNADA têm OC exclusiva
-      const rawOc = r[7] ? String(r[7]).trim() : null
-      const ocNumber = rawOc && rawOc !== "" && rawOc !== "0" ? rawOc : null
-
-      // oc_pending = tem volume mas ainda sem número de OC (pedido chegou fora de horário)
-      // SALDO não tem OC por definição — não é pending
-      const ocPending = ocNumber === null && volumeType !== "SALDO" && volumeType !== null
 
       const kg3  = numOf(r[10]), kg5  = numOf(r[11]), kg10 = numOf(r[12])
       const kg20 = numOf(r[13]), kg40 = numOf(r[14]), kg50 = numOf(r[15])
       const pesoKg = kg3*3 + kg5*5 + kg10*10 + kg20*20 + kg40*40 + kg50*50
-      const obs  = r[17] ? String(r[17]).trim() : null
 
       // Descarta linhas completamente vazias (sem tipo de volume e sem SKUs)
       if (!volumeType && pesoKg === 0) continue
 
+      // col[7] = coluna H = Nº Romaneio / OC
+      const rawOc = r[7] ? String(r[7]).trim() : null
+      const ocNumber = rawOc && rawOc !== "" && rawOc !== "0" ? rawOc : null
+      // SALDO não tem OC por definição — não é pending
+      const ocPending = ocNumber === null && volumeType !== "SALDO" && volumeType !== null
+      const obs = r[17] ? String(r[17]).trim() : null
+
       if (vdaMap.has(vdaKey)) {
         const entry = vdaMap.get(vdaKey)
-        // Acumula totais para cálculo de percentual
         entry.planned_kg3  += kg3
         entry.planned_kg5  += kg5
         entry.planned_kg10 += kg10
         entry.planned_kg20 += kg20
         entry.planned_kg40 += kg40
         entry.planned_kg50 += kg50
-        // Adiciona linha de volume (cada tipo é uma entrada separada)
         if (volumeType || pesoKg > 0) {
           entry.volumes.push({ type: volumeType, oc_number: ocNumber, oc_pending: ocPending,
             kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
         }
       } else {
-        // Primeira linha deste VDA
         const entry = {
           vda:            vdaKey,
           rota:           r[0] ? String(r[0]).trim() : null,
           motorista_name: r[2] ? String(r[2]).trim() : null,
           capacity_kg:    numOf(r[3]),
-          // Totais somados de todos os volumes (para percentual de carregamento)
-          planned_kg3:  kg3,
-          planned_kg5:  kg5,
-          planned_kg10: kg10,
-          planned_kg20: kg20,
-          planned_kg40: kg40,
-          planned_kg50: kg50,
-          // Detalhamento por tipo de volume (PRE-VENDA, TROCAS, MANIFESTO…)
+          planned_kg3:  kg3,  planned_kg5:  kg5,  planned_kg10: kg10,
+          planned_kg20: kg20, planned_kg40: kg40, planned_kg50: kg50,
           volumes: [],
         }
         if (volumeType || pesoKg > 0) {
@@ -129,15 +122,13 @@ export default async function plansRoutes(fastify) {
             kg3, kg5, kg10, kg20, kg40, kg50, peso_kg: pesoKg, obs })
         }
         vdaMap.set(vdaKey, entry)
-        vdaOrder.push(vdaKey)
       }
     }
 
-    // Monta array final, filtrando VDAs sem nenhum dado real
+    // Monta array final — Map já está em ordem de inserção
     const vehicles = []
     let seq = 0
-    for (const key of vdaOrder) {
-      const v = vdaMap.get(key)
+    for (const [, v] of vdaMap) {
       const totalSacos = v.planned_kg3 + v.planned_kg5 + v.planned_kg10 + v.planned_kg20 + v.planned_kg40 + v.planned_kg50
       if (totalSacos === 0 && v.capacity_kg === 0 && v.volumes.length === 0) continue
       seq++
@@ -213,48 +204,73 @@ export default async function plansRoutes(fastify) {
         [operationDate, plan.sheet_name, plan.source_date, JSON.stringify(plan), plan.total_vehicles]
       )
       const planId = dp.id
-      const vehicleIds = []
+      // Bulk insert de veículos — 1 query para todos (O(1) round-trips)
+      const vSeqs = [], vRotas = [], vVdas = [], vTypes = [], vCaps = [], vMots = [], vEquipes = []
       for (const v of plan.vehicles) {
-        // Detecta se é formato novo (planned_kg*) ou legado (volumes[])
+        vSeqs.push(v.sequence)
+        vRotas.push(v.rota)
+        vVdas.push(v.vda)
+        vTypes.push((v.vehicle_type || "unknown") === "3/4" ? "3/4" : (v.vehicle_type || "unknown"))
+        vCaps.push(v.capacity_kg || 0)
+        vMots.push(v.motorista_name || v.motorista || null)
+        vEquipes.push(v.equipe || [])
+      }
+      const { rows: insertedVehicles } = await client.query(
+        `INSERT INTO vehicles (daily_plan_id, sequence, rota, vda, vehicle_type, capacity_kg, motorista_name, equipe, state)
+         SELECT $1, unnest($2::int[]), unnest($3::text[]), unnest($4::text[]),
+                unnest($5::vehicle_type_enum[]), unnest($6::int[]), unnest($7::text[]),
+                unnest($8::text[][]), 'aguardando_carga'
+         RETURNING id, vda`,
+        [planId, vSeqs, vRotas, vVdas, vTypes, vCaps, vMots, vEquipes]
+      )
+      const vehicleIdByVda = new Map(insertedVehicles.map(r => [r.vda, r.id]))
+      const vehicleIds = insertedVehicles.map(r => ({ vda: r.vda, id: r.id }))
+
+      // Bulk insert de volumes — 1 query para todos os volumes de todos os veículos
+      const volVehicleIds = [], volTypes = [], volTopS = [], volOcExcl = [], volRetRule = []
+      const volOcNum = [], volOcPend = []
+      const volKg3 = [], volKg5 = [], volKg10 = [], volKg20 = [], volKg40 = [], volKg50 = []
+      const volPeso = [], volObs = []
+
+      for (const v of plan.vehicles) {
+        const vehicleId = vehicleIdByVda.get(v.vda)
+        if (!vehicleId) continue
         const isNewFormat = "planned_kg5" in v || "planned_kg10" in v
 
-        const { rows: [veh] } = await client.query(
-          `INSERT INTO vehicles (daily_plan_id, sequence, rota, vda, vehicle_type, capacity_kg, motorista_name, equipe, state)
-           VALUES ($1, $2, $3, $4, $5::vehicle_type_enum, $6, $7, $8, 'aguardando_carga') RETURNING id`,
-          [planId, v.sequence, v.rota, v.vda,
-           (v.vehicle_type || "unknown") === "3/4" ? "3/4" : (v.vehicle_type || "unknown"),
-           v.capacity_kg || 0, v.motorista_name || v.motorista || null, v.equipe || []]
-        )
-        vehicleIds.push({ vda: v.vda, id: veh.id })
-
         if (isNewFormat) {
-          // Formato painel-central: um volume "PRE-VENDA" com os SKUs direto
           const peso = (v.planned_kg3||0)*3 + (v.planned_kg5||0)*5 + (v.planned_kg10||0)*10
                      + (v.planned_kg20||0)*20 + (v.planned_kg40||0)*40 + (v.planned_kg50||0)*50
-          await client.query(
-            `INSERT INTO vehicle_volumes
-               (vehicle_id, volume_type, return_rule, oc_pending,
-                planned_kg3, planned_kg5, planned_kg10, planned_kg20, planned_kg40, planned_kg50, planned_peso_kg, obs)
-             VALUES ($1, 'PRE-VENDA'::volume_type_enum, 'none'::return_rule_enum, false,
-                     $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [veh.id, v.planned_kg3||0, v.planned_kg5||0, v.planned_kg10||0,
-             v.planned_kg20||0, v.planned_kg40||0, v.planned_kg50||0, peso, v.obs||null]
-          )
+          volVehicleIds.push(vehicleId); volTypes.push("PRE-VENDA"); volTopS.push(null)
+          volOcExcl.push(null); volRetRule.push("none"); volOcNum.push(null); volOcPend.push(false)
+          volKg3.push(v.planned_kg3||0); volKg5.push(v.planned_kg5||0); volKg10.push(v.planned_kg10||0)
+          volKg20.push(v.planned_kg20||0); volKg40.push(v.planned_kg40||0); volKg50.push(v.planned_kg50||0)
+          volPeso.push(peso); volObs.push(v.obs||null)
         } else {
-          // Formato legado com volumes[]
           for (const vol of (v.volumes || [])) {
-            await client.query(
-              `INSERT INTO vehicle_volumes
-                 (vehicle_id, volume_type, top_sankhya, oc_exclusive, return_rule, oc_number, oc_pending,
-                  planned_kg3, planned_kg5, planned_kg10, planned_kg20, planned_kg40, planned_kg50, planned_peso_kg, obs)
-               VALUES ($1, $2::volume_type_enum, $3, $4, $5::return_rule_enum, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-              [veh.id, vol.type, vol.top_sankhya, vol.oc_exclusive, vol.return_rule, vol.oc_number, vol.oc_pending,
-               vol.skus?.kg3||0, vol.skus?.kg5||0, vol.skus?.kg10||0, vol.skus?.kg20||0,
-               vol.skus?.kg40||0, vol.skus?.kg50||0, vol.peso_kg||0, vol.obs||null]
-            )
+            volVehicleIds.push(vehicleId); volTypes.push(vol.type); volTopS.push(vol.top_sankhya||null)
+            volOcExcl.push(vol.oc_exclusive||null); volRetRule.push(vol.return_rule||"none")
+            volOcNum.push(vol.oc_number||null); volOcPend.push(vol.oc_pending||false)
+            volKg3.push(vol.skus?.kg3||0); volKg5.push(vol.skus?.kg5||0); volKg10.push(vol.skus?.kg10||0)
+            volKg20.push(vol.skus?.kg20||0); volKg40.push(vol.skus?.kg40||0); volKg50.push(vol.skus?.kg50||0)
+            volPeso.push(vol.peso_kg||0); volObs.push(vol.obs||null)
           }
         }
       }
+
+      if (volVehicleIds.length > 0) {
+        await client.query(
+          `INSERT INTO vehicle_volumes
+             (vehicle_id, volume_type, top_sankhya, oc_exclusive, return_rule, oc_number, oc_pending,
+              planned_kg3, planned_kg5, planned_kg10, planned_kg20, planned_kg40, planned_kg50, planned_peso_kg, obs)
+           SELECT unnest($1::int[]), unnest($2::volume_type_enum[]), unnest($3::text[]), unnest($4::text[]),
+                  unnest($5::return_rule_enum[]), unnest($6::text[]), unnest($7::bool[]),
+                  unnest($8::int[]), unnest($9::int[]), unnest($10::int[]), unnest($11::int[]),
+                  unnest($12::int[]), unnest($13::int[]), unnest($14::int[]), unnest($15::text[])`,
+          [volVehicleIds, volTypes, volTopS, volOcExcl, volRetRule, volOcNum, volOcPend,
+           volKg3, volKg5, volKg10, volKg20, volKg40, volKg50, volPeso, volObs]
+        )
+      }
+
       await client.query("COMMIT")
       return reply.code(201).send({ planId, operationDate, totalVehicles: plan.total_vehicles, vehicles: vehicleIds })
     } catch (err) {
@@ -267,85 +283,49 @@ export default async function plansRoutes(fastify) {
   })
 
   // ─── Importação da Programação Excel ───────────────────────────────────────
+  // F) Parser unificado — reutiliza parseXlsxBuffer para sheet name / header / numOf / toKey
   fastify.post("/plans/import-programacao", async (req, reply) => {
     try {
       const data = await req.file()
       if (!data) return reply.code(400).send({ error: "Arquivo nao encontrado no campo 'file'" })
 
       const buffer = await data.toBuffer()
-      const wb = XLSX.read(buffer, { type: "buffer", raw: true })
 
+      // Normaliza targetDate para YYYY-MM-DD
       const targetDateStr = req.body?.date
-      let operationDate
+      let targetDate = null
       if (targetDateStr) {
         if (/^\d{4}-\d{2}-\d{2}$/.test(targetDateStr)) {
-          operationDate = targetDateStr
+          targetDate = targetDateStr
         } else {
-          const m = targetDateStr.match(/^(\d{2})\.(\d{2})\.(\d{4})$/)
-          if (m) operationDate = `${m[3]}-${m[2]}-${m[1]}`
+          const mDate = targetDateStr.match(/^(\d{2})\.(\d{2})\.(\d{4})$/)
+          if (mDate) targetDate = `${mDate[3]}-${mDate[2]}-${mDate[1]}`
         }
       }
-      if (!operationDate) {
-        const now = new Date(Date.now() - 3 * 60 * 60 * 1000)
-        const [y, m, d] = now.toISOString().split("T")[0].split("-")
-        operationDate = `${y}-${m}-${d}`
+
+      // Reutiliza parseXlsxBuffer — mesmos helpers, mesma lógica de sheet
+      let parsed
+      try {
+        parsed = parseXlsxBuffer(buffer, targetDate)
+      } catch (err) {
+        return reply.code(err.code || 422).send({ error: err.message, sheets_available: err.sheets_available })
       }
 
-      const [y, m, d] = operationDate.split("-")
-      const sheetName = `${d}.${m}.${y}`
-      const ws = wb.Sheets[sheetName]
-      if (!ws) {
-        const available = wb.SheetNames.join(", ")
-        return reply.code(404).send({ error: `Sheet '${sheetName}' nao encontrada no arquivo`, sheets_available: available })
-      }
+      const operationDate = parsed.date
+      const sheetName     = parsed.sheetName
 
-      const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true, blankrows: false })
-
-      let headerRow = -1
-      for (let i = 0; i < Math.min(raw.length, 10); i++) {
-        const row = raw[i]
-        if (row && row.some(c => typeof c === "string" && c.toUpperCase().includes("VDA"))) {
-          headerRow = i
-          break
-        }
-      }
-      if (headerRow === -1) {
-        return reply.code(422).send({ error: "Cabecalho com 'VDA' nao encontrado na sheet" })
-      }
-
-      const numOf = (v) => {
-        if (v === null || v === undefined || v === "") return 0
-        const n = Number(v)
-        return isNaN(n) ? 0 : Math.round(n)
-      }
-
-      const toKey = (v) => {
-        if (v === null || v === undefined) return null
-        const s = String(v).trim().toUpperCase()
-        if (s.includes("ACCELO") || s.includes("ACELO")) return "ACCELO"
-        const digits = s.replace(/\D/g, "")
-        if (!digits) return null
-        return String(parseInt(digits, 10))
-      }
-
-      const vehicles = []
-      let seq = 0
-      for (let i = headerRow + 1; i < raw.length; i++) {
-        const r = raw[i]
-        if (!r || r.every(c => c === null)) continue
-        const vdaKey = toKey(r[1])
-        if (!vdaKey) continue
-        const rota       = r[0] ? String(r[0]).trim() : null
-        const capacidade = numOf(r[3])
-        const kg5        = numOf(r[11])
-        const kg10       = numOf(r[12])
-        const kg20       = numOf(r[13])
-        const kg40       = numOf(r[14])
-        const obs        = r[17] ? String(r[17]).trim() : null
-        if (kg5 === 0 && kg10 === 0 && kg20 === 0 && kg40 === 0 && capacidade === 0) continue
-        seq++
-        vehicles.push({ seq, vda: vdaKey, rota, capacity_kg: capacidade, kg5, kg10, kg20, kg40, obs })
-      }
+      // Extrai apenas os campos relevantes para programação (kg5/10/20/40)
+      const vehicles = parsed.vehicles
+        .map((v, idx) => {
+          const kg5  = v.planned_kg5  || 0
+          const kg10 = v.planned_kg10 || 0
+          const kg20 = v.planned_kg20 || 0
+          const kg40 = v.planned_kg40 || 0
+          const obs  = v.volumes?.[0]?.obs || null
+          if (kg5 === 0 && kg10 === 0 && kg20 === 0 && kg40 === 0 && v.capacity_kg === 0) return null
+          return { seq: idx + 1, vda: v.vda, rota: v.rota, capacity_kg: v.capacity_kg, kg5, kg10, kg20, kg40, obs }
+        })
+        .filter(Boolean)
 
       if (vehicles.length === 0) {
         return reply.code(422).send({ error: "Nenhum veiculo com dados encontrado na sheet" })
@@ -362,39 +342,92 @@ export default async function plansRoutes(fastify) {
       }
       const planId = plan.id
 
-      const client = await fastify.db.pool.connect()
-      const results = []
-      try {
-        await client.query("BEGIN")
-        for (const v of vehicles) {
-          const { rows: [veh] } = await client.query(
-            `SELECT id FROM vehicles WHERE daily_plan_id = $1 AND vda = $2`, [planId, v.vda]
-          )
-          if (!veh) { results.push({ vda: v.vda, status: "nao_encontrado_no_plano" }); continue }
-          const { rows: [vol] } = await client.query(
-            `SELECT id FROM vehicle_volumes WHERE vehicle_id = $1 LIMIT 1`, [veh.id]
-          )
-          if (vol) {
+      // ── E) Bulk lookup + update/insert — O(3) queries independente de N ──────
+      const vdaList = vehicles.map(v => v.vda)
+      const { rows: existingVehicles } = await fastify.db.query(
+        `SELECT id, vda FROM vehicles WHERE daily_plan_id = $1 AND vda = ANY($2::text[])`,
+        [planId, vdaList]
+      )
+      const vehicleIdByVda = new Map(existingVehicles.map(r => [r.vda, r.id]))
+      const foundVdas = new Set(existingVehicles.map(r => r.vda))
+
+      // Separa veículos encontrados dos não encontrados
+      const notFound = vehicles.filter(v => !foundVdas.has(v.vda))
+      const toProcess = vehicles.filter(v => foundVdas.has(v.vda))
+
+      const results = notFound.map(v => ({ vda: v.vda, status: "nao_encontrado_no_plano" }))
+
+      if (toProcess.length > 0) {
+        const vehicleIds = toProcess.map(v => vehicleIdByVda.get(v.vda))
+
+        // Busca o primeiro volume de cada veículo em bulk
+        const { rows: existingVols } = await fastify.db.query(
+          `SELECT DISTINCT ON (vehicle_id) id, vehicle_id
+           FROM vehicle_volumes WHERE vehicle_id = ANY($1::int[])
+           ORDER BY vehicle_id, id`,
+          [vehicleIds]
+        )
+        const volIdByVehicleId = new Map(existingVols.map(r => [r.vehicle_id, r.id]))
+
+        const toUpdate = toProcess.filter(v => volIdByVehicleId.has(vehicleIdByVda.get(v.vda)))
+        const toCreate = toProcess.filter(v => !volIdByVehicleId.has(vehicleIdByVda.get(v.vda)))
+
+        const client = await fastify.db.pool.connect()
+        try {
+          await client.query("BEGIN")
+
+          // UPDATE em bulk com UNNEST
+          if (toUpdate.length > 0) {
+            const upIds  = toUpdate.map(v => volIdByVehicleId.get(vehicleIdByVda.get(v.vda)))
+            const upKg5  = toUpdate.map(v => v.kg5)
+            const upKg10 = toUpdate.map(v => v.kg10)
+            const upKg20 = toUpdate.map(v => v.kg20)
+            const upKg40 = toUpdate.map(v => v.kg40)
+            const upObs  = toUpdate.map(v => v.obs || null)
             await client.query(
-              `UPDATE vehicle_volumes SET planned_kg5=$1, planned_kg10=$2, planned_kg20=$3, planned_kg40=$4, obs=COALESCE($5,obs) WHERE id=$6`,
-              [v.kg5, v.kg10, v.kg20, v.kg40, v.obs, vol.id]
+              `UPDATE vehicle_volumes AS vv SET
+                 planned_kg5  = u.kg5,
+                 planned_kg10 = u.kg10,
+                 planned_kg20 = u.kg20,
+                 planned_kg40 = u.kg40,
+                 obs = COALESCE(u.obs, vv.obs)
+               FROM (SELECT unnest($1::int[]) AS id, unnest($2::int[]) AS kg5,
+                            unnest($3::int[]) AS kg10, unnest($4::int[]) AS kg20,
+                            unnest($5::int[]) AS kg40, unnest($6::text[]) AS obs) AS u
+               WHERE vv.id = u.id`,
+              [upIds, upKg5, upKg10, upKg20, upKg40, upObs]
             )
-            results.push({ vda: v.vda, status: "atualizado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
-          } else {
-            await client.query(
-              `INSERT INTO vehicle_volumes (vehicle_id, volume_type, planned_kg5, planned_kg10, planned_kg20, planned_kg40, obs) VALUES ($1,'frio'::volume_type_enum,$2,$3,$4,$5,$6)`,
-              [veh.id, v.kg5, v.kg10, v.kg20, v.kg40, v.obs]
-            )
-            results.push({ vda: v.vda, status: "criado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
+            for (const v of toUpdate)
+              results.push({ vda: v.vda, status: "atualizado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
           }
+
+          // INSERT em bulk com UNNEST
+          if (toCreate.length > 0) {
+            const cIds  = toCreate.map(v => vehicleIdByVda.get(v.vda))
+            const cKg5  = toCreate.map(v => v.kg5)
+            const cKg10 = toCreate.map(v => v.kg10)
+            const cKg20 = toCreate.map(v => v.kg20)
+            const cKg40 = toCreate.map(v => v.kg40)
+            const cObs  = toCreate.map(v => v.obs || null)
+            await client.query(
+              `INSERT INTO vehicle_volumes (vehicle_id, volume_type, planned_kg5, planned_kg10, planned_kg20, planned_kg40, obs)
+               SELECT unnest($1::int[]), 'frio'::volume_type_enum,
+                      unnest($2::int[]), unnest($3::int[]), unnest($4::int[]),
+                      unnest($5::int[]), unnest($6::text[])`,
+              [cIds, cKg5, cKg10, cKg20, cKg40, cObs]
+            )
+            for (const v of toCreate)
+              results.push({ vda: v.vda, status: "criado", kg5: v.kg5, kg10: v.kg10, kg20: v.kg20, kg40: v.kg40 })
+          }
+
+          await client.query("COMMIT")
+        } catch (err) {
+          await client.query("ROLLBACK")
+          fastify.log.error({ err }, "Erro ao salvar programacao")
+          return reply.code(500).send({ error: err.message })
+        } finally {
+          client.release()
         }
-        await client.query("COMMIT")
-      } catch (err) {
-        await client.query("ROLLBACK")
-        fastify.log.error({ err }, "Erro ao salvar programacao")
-        return reply.code(500).send({ error: err.message })
-      } finally {
-        client.release()
       }
 
       return reply.code(200).send({
